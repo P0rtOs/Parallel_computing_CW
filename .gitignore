@@ -31,4 +31,7 @@
 *.out
 *.app
 
+# No RUSSIAN
+*.pyc
+
 aclImdb
