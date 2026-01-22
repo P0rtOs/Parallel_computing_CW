@@ -6,8 +6,15 @@
 #include <thread>
 #include <iostream>
 #include <sstream>
+#include <filesystem>
+#include <cstdint>
+#include <atomic>
+#include <cstring>
+#include <algorithm>
+#include <cctype>
 
-#include "IndexManager.h"
+#include "index_manager.h"
+#include "data_structure/thread_pool.h"
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -25,7 +32,9 @@
 class Server {
 public:
     Server()
-        : listenSocket(INVALID_SOCKET)
+        : listenSocket(INVALID_SOCKET),
+          stopRequested(false),
+          threadPoolStarted(false)
     {}
 
     ~Server() {
@@ -81,7 +90,7 @@ public:
 
         sockaddr_in addr;
         addr.sin_family = AF_INET;
-        addr.sin_port   = htons(static_cast<uint16_t>(port));
+        addr.sin_port   = htons(static_cast<std::uint16_t>(port));
         addr.sin_addr.s_addr = inet_addr(ip.c_str());
         if (addr.sin_addr.s_addr == INADDR_NONE) {
             std::cerr << "inet_addr() failed for ip: " << ip << "\n";
@@ -106,8 +115,40 @@ public:
             return false;
         }
 
+        baseDir = std::filesystem::path("text_files") / "aclImdb";
+        {
+            std::cout << "Indexing directory: " << baseDir.generic_string() << "\n";
+            bool ok = indexManager.indexDirectory(baseDir, true);
+            if (!ok) {
+                std::cerr << "WARNING: index directory not found: "
+                          << baseDir.generic_string() << "\n";
+            } else {
+                std::cout << "Index built.\n";
+            }
+        }
+
         std::cout << "Server listening on " << ip << ":" << port << "\n";
+
+        if (!threadPoolStarted) {
+            unsigned int hc = std::thread::hardware_concurrency();
+            if (hc == 0) {
+                hc = 4;
+            }
+            threadPool.start(static_cast<std::size_t>(hc));
+            threadPoolStarted = true;
+        }
+
         return true;
+    }
+
+    std::filesystem::path resolvePathToBaseDir(const std::string& raw) const {
+    std::filesystem::path p(raw);
+
+    if (p.is_absolute()) {
+        return p;
+    }
+
+    return baseDir / p;
     }
 
     void acceptLoop() {
@@ -116,7 +157,7 @@ public:
             return;
         }
 
-        while (true) {
+        while (!stopRequested.load()) {
             sockaddr_in clientAddr;
         #ifdef _WIN32
             int addrLen = sizeof(clientAddr);
@@ -128,19 +169,34 @@ public:
                                          reinterpret_cast<sockaddr*>(&clientAddr),
                                          &addrLen);
             if (clientSocket == INVALID_SOCKET) {
+                if (stopRequested.load()) {
+                    break;
+                }
                 std::cerr << "accept() failed\n";
                 break;
             }
 
-            std::thread t(&Server::handleClient, this, clientSocket);
-            t.detach();
+            bool queued = threadPool.enqueue([this, clientSocket]() {
+                this->handleClient(clientSocket);
+            });
+
+            if (!queued) {
+                closeSocket(clientSocket);
+            }
         }
     }
 
     void stop() {
+        stopRequested.store(true);
+
         if (listenSocket != INVALID_SOCKET) {
             closeSocket(listenSocket);
             listenSocket = INVALID_SOCKET;
+        }
+
+        if (threadPoolStarted) {
+            threadPool.stop();
+            threadPoolStarted = false;
         }
     }
 
@@ -157,29 +213,194 @@ private:
         int clientSocket
     #endif
     ) {
-        char buffer[4096];
-        int received = ::recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-        if (received <= 0) {
+        std::string requestLine;
+        bool ok = recvLine(clientSocket, requestLine);
+        if (!ok) {
             closeSocket(clientSocket);
             return;
         }
-        buffer[received] = '\0';
 
-        std::string request(buffer);
-        std::string response = processRequest(request);
-
+        std::string response = processRequest(requestLine);
         if (!response.empty()) {
-            ::send(clientSocket, response.c_str(),
-                   static_cast<int>(response.size()), 0);
+            sendAll(clientSocket, response.c_str(), response.size());
         }
 
         closeSocket(clientSocket);
+    }
+
+    bool recvLine(
+    #ifdef _WIN32
+        SOCKET s,
+    #else
+        int s,
+    #endif
+        std::string& outLine
+    ) {
+        outLine.clear();
+
+        const std::size_t MAX_LINE = 16 * 1024; // 16 KB
+
+        char buf[512];
+        while (outLine.size() < MAX_LINE) {
+            int n = ::recv(s, buf, static_cast<int>(sizeof(buf)), 0);
+
+            if (n == 0) {
+                return !outLine.empty();
+            }
+
+            if (n < 0) {
+                return false;
+            }
+
+            outLine.append(buf, buf + n);
+
+            std::size_t pos = outLine.find('\n');
+            if (pos != std::string::npos) {
+                outLine.resize(pos);
+                if (!outLine.empty() && outLine.back() == '\r') {
+                    outLine.pop_back();
+                }
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool sendAll(
+    #ifdef _WIN32
+        SOCKET s,
+    #else
+        int s,
+    #endif
+        const char* data,
+        std::size_t len
+    ) {
+        std::size_t sentTotal = 0;
+        while (sentTotal < len) {
+            const char* ptr = data + sentTotal;
+            std::size_t left = len - sentTotal;
+
+            int chunk = 0;
+#ifdef _WIN32
+            chunk = ::send(s, ptr, static_cast<int>(left), 0);
+#else
+            // на linux send() приймає size_t, але повертає ssize_t
+            chunk = static_cast<int>(::send(s, ptr, left, 0));
+#endif
+
+            if (chunk <= 0) {
+                return false;
+            }
+            sentTotal += static_cast<std::size_t>(chunk);
+        }
+        return true;
     }
 
     std::string processRequest(const std::string& request) {
         std::istringstream iss(request);
         std::string command;
         iss >> command;
+
+        if (command == "INDEX_ALL") {
+            bool ok = indexManager.indexDirectory(baseDir, true);
+            if (!ok) {
+                return "ERROR Index directory not found\n";
+            }
+            return "OK 1\nINDEXED\nEND\n";
+        }
+
+        auto readRestAsPath = [&iss]() -> std::string {
+            std::string rest;
+            std::getline(iss, rest);
+            while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front()))) {
+                rest.erase(rest.begin());
+            }
+            while (!rest.empty() && (rest.back() == '\r' || std::isspace(static_cast<unsigned char>(rest.back())))) {
+                rest.pop_back();
+            }
+            if (rest.size() >= 2 && ((rest.front() == '"' && rest.back() == '"') || (rest.front() == '\'' && rest.back() == '\''))) {
+                rest = rest.substr(1, rest.size() - 2);
+            }
+            return rest;
+        };
+
+        auto okSimple = []() -> std::string {
+            return "OK 1\nEND\n";
+        };
+
+        auto err = [](const std::string& msg) -> std::string {
+            return "ERROR " + msg + "\nEND\n";
+        };
+
+        if (command == "ADD_FILE") {
+            std::string raw = readRestAsPath();
+            std::string path = resolvePathToBaseDir(raw).generic_string();
+            if (path.empty()) return err("Missing path for ADD_FILE");
+
+            unsigned int id = 0;
+            if (indexManager.hasFile(path, id)) {
+                return err("File already indexed");
+            }
+
+            bool ok = indexManager.addFile(path);
+            return ok ? okSimple() : err("Could not read file (not found / no access)");
+        }
+
+        if (command == "REINDEX_FILE") {
+            std::string raw = readRestAsPath();
+            std::string path = resolvePathToBaseDir(raw).generic_string();
+
+            if (path.empty()) return err("Missing path for REINDEX_FILE");
+
+            bool ok = indexManager.reindexFile(path);
+            return ok ? okSimple() : err("Could not read file (not found / no access)");
+        }
+
+        if (command == "HAS_FILE") {
+            std::string raw = readRestAsPath();
+            std::string path = resolvePathToBaseDir(raw).generic_string();
+            if (path.empty()) return err("Missing path for HAS_FILE");
+
+            unsigned int id = 0;
+            bool found = indexManager.hasFile(path, id);
+            if (!found) {
+                return "OK 0\nEND\n";
+            }
+            return "OK 1\nYES\nEND\n";
+        }
+
+        if (command == "REMOVE_FILE") {
+            std::string raw = readRestAsPath();
+            std::string path = resolvePathToBaseDir(raw).generic_string();
+
+            if (path.empty()) return err("Missing path for REMOVE_FILE");
+
+            bool ok = indexManager.removeFile(path);
+            return ok ? okSimple() : err("File not in index");
+        }
+
+        if (command == "INDEX_DIR" || command == "REINDEX_DIR" || command == "REBUILD_INDEX") {
+            std::string dir = readRestAsPath();
+            if (dir.empty()) return err("Missing dir path");
+
+            if (command == "REBUILD_INDEX") {
+                indexManager.clearAll();
+            }
+
+            std::size_t indexed = 0;
+            std::size_t failed  = 0;
+            bool reindexExisting = (command == "REINDEX_DIR");
+
+            bool ok = indexManager.indexDirectory(dir, indexed, failed, reindexExisting);
+            if (!ok) return err("Directory not found / not a directory");
+
+            std::ostringstream oss;
+            oss << "OK " << indexed << "\n";
+            oss << "FAILED " << failed << "\n";
+            oss << "END\n";
+            return oss.str();
+        }
 
         if (command == "SEARCH_ONE") {
             std::string word;
@@ -252,7 +473,12 @@ private:
     int listenSocket;
 #endif
 
+    std::atomic<bool> stopRequested;
+    bool threadPoolStarted;
+    ThreadPool threadPool;
+
     IndexManager indexManager;
+    std::filesystem::path baseDir = std::filesystem::path("text_files") / "aclImdb";
 };
 
 #endif

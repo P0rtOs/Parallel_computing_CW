@@ -1,41 +1,20 @@
 #include <iostream>
-#include <thread>
-#include <vector>
-#include "concurrent_queue.h"
+#include "server.h"
 
 int main() {
-    ConcurrentQueue<int> q;
+    if (!Server::initSockets()) {
+        return 1;
+    }
 
-    std::thread producer1([&]() {
-        for (int i = 0; i < 50; ++i) {
-            q.push(i);
-        }
-    });
+    Server server;
+    if (!server.initServer("127.0.0.1", 8080)) {
+        Server::cleanupSockets();
+        return 1;
+    }
 
-    std::thread producer2([&]() {
-        for (int i = 100; i < 150; ++i) {
-            q.push(i);
-        }
-    });
+    server.acceptLoop();
 
-    std::thread consumer([&]() {
-        int value;
-        for (;;) {
-            if (q.try_pop(value)) {
-                std::cout << "Got: " << value << "\n";
-            } else {
-                std::this_thread::yield();
-            }
-
-            if (q.empty()) {
-            }
-        }
-    });
-
-    producer1.join();
-    producer2.join();
-
-    consumer.detach();
-
+    server.stop();
+    Server::cleanupSockets();
     return 0;
 }

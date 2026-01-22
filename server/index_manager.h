@@ -7,11 +7,14 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <filesystem>
+#include <shared_mutex>
+#include <mutex>
 
-#include "IdValueTable.h"
-#include "ForwardIndex.h"
-#include "InvertedIndex.h"
-#include "text_utils.h"
+#include "data_structure/unordered_map.h"
+#include "data_structure/forward_index.h"
+#include "data_structure/inverted_index.h"
+#include "utils/text_utils.h"
 
 class IndexManager {
 public:
@@ -23,7 +26,48 @@ public:
     IndexManager& operator=(IndexManager&&)      = delete;
 
     bool hasFile(const std::string& docPath, unsigned int& outDocId) const {
+        std::shared_lock<std::shared_mutex> lock(rwLock);
         return docTable.getId(docPath, outDocId);
+    }
+
+    bool indexDirectory(const std::filesystem::path& baseDir, bool clearFirst = true) {
+        namespace fs = std::filesystem;
+
+        std::error_code ec;
+        fs::path dir = fs::weakly_canonical(baseDir, ec);
+        if (ec) {
+            dir = baseDir;
+        }
+
+        if (!fs::exists(dir)) {
+            return false;
+        }
+
+        if (clearFirst) {
+            clearAll();
+        }
+
+        fs::recursive_directory_iterator it(
+            dir,
+            fs::directory_options::skip_permission_denied,
+            ec
+        );
+
+        for (const auto& entry : it) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            if (!entry.is_regular_file(ec)) {
+                ec.clear();
+                continue;
+            }
+
+            reindexFile(entry.path().generic_string());
+        }
+
+        return true;
     }
 
     bool getFileContent(const std::string& docPath, std::string& outContent) const {
@@ -39,12 +83,27 @@ public:
     }
 
     bool addFile(const std::string& docPath) {
+        {
+            std::shared_lock<std::shared_mutex> lock(rwLock);
+            unsigned int existingId = 0;
+            if (docTable.getId(docPath, existingId)) {
+                return false; // already indexed
+            }
+        }
+
         std::string content;
         if (!getFileContent(docPath, content)) {
             return false;
         }
-        addDocumentFromContent(docPath, content);
-        return true;
+        {
+            std::unique_lock<std::shared_mutex> lock(rwLock);
+            unsigned int existingId = 0;
+            if (docTable.getId(docPath, existingId)) {
+                return false; // raced: already indexed
+            }
+            addDocumentFromContent(docPath, content);
+            return true;
+        }
     }
 
     bool reindexFile(const std::string& docPath) {
@@ -52,6 +111,8 @@ public:
         if (!getFileContent(docPath, content)) {
             return false;
         }
+        
+        std::unique_lock<std::shared_mutex> lock(rwLock);
 
         unsigned int docId = 0;
         if (!docTable.getId(docPath, docId)) {
@@ -74,6 +135,8 @@ public:
     }
 
     bool removeFile(const std::string& docPath) {
+        std::unique_lock<std::shared_mutex> lock(rwLock);
+
         unsigned int docId = 0;
         if (!docTable.getId(docPath, docId)) {
             return false;
@@ -93,14 +156,56 @@ public:
     }
 
     void clearAll() {
+        std::unique_lock<std::shared_mutex> lock(rwLock);
         wordTable.clear();
         docTable.clear();
         forwardIndex.clear();
         invertedIndex.clear();
     }
 
+    bool indexDirectory(const std::string& dirPath,
+                        std::size_t& outIndexed,
+                        std::size_t& outFailed,
+                        bool reindexExisting = false) {
+        namespace fs = std::filesystem;
+        outIndexed = 0;
+        outFailed  = 0;
+
+        std::error_code ec;
+        fs::path base(dirPath);
+        if (!fs::exists(base, ec) || !fs::is_directory(base, ec)) {
+            return false;
+        }
+
+        for (const fs::directory_entry& entry : fs::recursive_directory_iterator(base, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec)) continue;
+
+            std::string filePath = entry.path().string();
+
+            bool ok = false;
+            if (reindexExisting) {
+                ok = reindexFile(filePath);
+            } else {
+                // skip existing
+                unsigned int tmpId = 0;
+                if (hasFile(filePath, tmpId)) {
+                    continue;
+                }
+                ok = addFile(filePath);
+            }
+
+            if (ok) ++outIndexed;
+            else    ++outFailed;
+        }
+
+        return true;
+    }
+
     bool searchSingleWord(const std::string& rawWord,
                           std::vector<std::string>& outDocPaths) const {
+        std::shared_lock<std::shared_mutex> lock(rwLock);
+
         outDocPaths.clear();
 
         std::string word = rawWord;
@@ -133,6 +238,7 @@ public:
 
     bool searchAllWords(const std::vector<std::string>& rawWords,
                         std::vector<std::string>& outDocPaths) const {
+        std::shared_lock<std::shared_mutex> lock(rwLock);
         outDocPaths.clear();
         if (rawWords.empty()) {
             return false;
@@ -196,6 +302,7 @@ public:
 
     bool searchAnyWord(const std::vector<std::string>& rawWords,
                        std::vector<std::string>& outDocPaths) const {
+        std::shared_lock<std::shared_mutex> lock(rwLock);
         outDocPaths.clear();
 
         std::unordered_set<unsigned int> resultDocIds;
@@ -274,6 +381,8 @@ private:
     }
 
 private:
+    mutable std::shared_mutex rwLock;
+    
     IdValueTable<std::string> wordTable;
     IdValueTable<std::string> docTable;
     ForwardIndex              forwardIndex;
