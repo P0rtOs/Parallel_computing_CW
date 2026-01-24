@@ -6,11 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(server
-    main.cpp
+    server/main.cpp
 )
 
-# щоб інклуди типу "data_structure/..." і "utils/..." працювали
-target_include_directories(server PRIVATE ${CMAKE_SOURCE_DIR})
+# щоб інклуди типу "utils/...", "data_structure/...", "constants/..." працювали
+target_include_directories(server PRIVATE
+    ${CMAKE_SOURCE_DIR}/server
+)
 
 if (WIN32)
     target_link_libraries(server PRIVATE ws2_32)

@@ -5,7 +5,6 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
-#include <cstdint>
 
 class ForwardIndex {
 public:

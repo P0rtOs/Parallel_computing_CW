@@ -72,7 +72,6 @@ public:
         }
         workers.clear();
 
-        // На виході гарантуємо, що задачі не висять у черзі
         {
             std::lock_guard<std::mutex> lock(mutex);
             while (!tasks.empty()) {
@@ -106,7 +105,6 @@ private:
             try {
                 task();
             } catch (...) {
-                // щоб воркер не впав через exception
             }
         }
     }

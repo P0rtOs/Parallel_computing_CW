@@ -4,10 +4,7 @@
 #include <unordered_map>
 #include <shared_mutex>
 #include <mutex>
-#include <cstdint>
-
-// Проста двостороння таблиця відповідностей:
-//   ID (unsigned int) <-> Value (std::string)
+#include <vector>
 
 template <typename Value>
 class IdValueTable {
@@ -133,7 +130,16 @@ public:
         return static_cast<unsigned int>(idToValue.size());
     }
 
-private:
+    void snapshotValues(std::vector<Value>& out) const {
+        std::shared_lock<std::shared_mutex> lock(mutex);
+        out.clear();
+        out.reserve(idToValue.size());
+        for (const auto& kv : idToValue) {
+            out.push_back(kv.second);
+        }
+    }
+
+    private:
     mutable std::shared_mutex mutex;
     std::unordered_map<unsigned int, Value> idToValue;
     std::unordered_map<Value, unsigned int> valueToId;

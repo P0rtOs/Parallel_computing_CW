@@ -9,16 +9,60 @@
 #include <filesystem>
 #include <cstdint>
 #include <atomic>
-#include <cstring>
-#include <algorithm>
 #include <cctype>
+#include <csignal>
+#include <chrono>
 
 #include "index_manager.h"
 #include "data_structure/thread_pool.h"
+#include "utils/logger.h"
+#include "utils/timer.h"
+#include "utils/repeating_task.h"
+#include "utils/response_builder.h"
+#include "constants/commands.h"
+
 #ifdef _WIN32
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <windows.h>
     #pragma comment(lib, "Ws2_32.lib")
+
+    #ifdef INDEX_ALL
+    #undef INDEX_ALL
+    #endif
+    #ifdef ADD_FILE
+    #undef ADD_FILE
+    #endif
+    #ifdef REMOVE_FILE
+    #undef REMOVE_FILE
+    #endif
+    #ifdef REINDEX_FILE
+    #undef REINDEX_FILE
+    #endif
+    #ifdef HAS_FILE
+    #undef HAS_FILE
+    #endif
+    #ifdef INDEX_DIR
+    #undef INDEX_DIR
+    #endif
+    #ifdef REINDEX_DIR
+    #undef REINDEX_DIR
+    #endif
+    #ifdef REBUILD_INDEX
+    #undef REBUILD_INDEX
+    #endif
+    #ifdef SEARCH_ONE
+    #undef SEARCH_ONE
+    #endif
+    #ifdef SEARCH_ALL
+    #undef SEARCH_ALL
+    #endif
+    #ifdef SEARCH_ANY
+    #undef SEARCH_ANY
+    #endif
 #else
     #include <sys/types.h>
     #include <sys/socket.h>
@@ -31,6 +75,19 @@
 
 class Server {
 public:
+    struct Config {
+        std::string ip = "127.0.0.1";
+        int         port = 8080;
+        std::filesystem::path baseDir = std::filesystem::path("text_files") / "aclImdb";
+
+        bool enableScheduler = true;
+        std::chrono::milliseconds schedulerInterval{ std::chrono::seconds(10) };
+
+        std::size_t threadCount = 0;
+        bool removeMissing = true;
+        bool clearIndexOnStart = true;
+    };
+
     Server()
         : listenSocket(INVALID_SOCKET),
           stopRequested(false),
@@ -64,8 +121,38 @@ public:
     #endif
     }
 
-    bool initServer(const std::string& ip, int port) {
-        // Створити сокет
+    // встановлює глобальний хендлер, який:
+    // - ставить stopRequested
+    // - закриває listen socket
+    static void installSignalHandlers(Server* srv) {
+        instanceForSignals = srv;
+#ifdef _WIN32
+        SetConsoleCtrlHandler(&Server::consoleCtrlHandler, TRUE);
+#else
+        std::signal(SIGINT,  &Server::posixSignalHandler);
+        std::signal(SIGTERM, &Server::posixSignalHandler);
+#endif
+    }
+
+    void requestStop() {
+        stopRequested.store(true);
+        indexScheduler.requestStop();
+        if (listenSocket != INVALID_SOCKET) {
+            closeSocket(listenSocket);
+            listenSocket = INVALID_SOCKET;
+        }
+    }
+
+    Logger& getLogger() { return logger; }
+
+        bool initServer(const std::string& ip, int port) {
+        Config cfg;
+        cfg.ip = ip;
+        cfg.port = port;
+        return initServer(cfg);
+    }
+
+    bool initServer(const Config& cfg) {
     #ifdef _WIN32
         listenSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     #else
@@ -90,10 +177,10 @@ public:
 
         sockaddr_in addr;
         addr.sin_family = AF_INET;
-        addr.sin_port   = htons(static_cast<std::uint16_t>(port));
-        addr.sin_addr.s_addr = inet_addr(ip.c_str());
+        addr.sin_port   = htons(static_cast<std::uint16_t>(cfg.port));
+        addr.sin_addr.s_addr = inet_addr(cfg.ip.c_str());
         if (addr.sin_addr.s_addr == INADDR_NONE) {
-            std::cerr << "inet_addr() failed for ip: " << ip << "\n";
+            std::cerr << "inet_addr() failed for ip: " << cfg.ip << "\n";
             closeSocket(listenSocket);
             listenSocket = INVALID_SOCKET;
             return false;
@@ -115,26 +202,73 @@ public:
             return false;
         }
 
-        baseDir = std::filesystem::path("text_files") / "aclImdb";
+        baseDir = cfg.baseDir;
         {
+            indexManager.setLogger(&logger);
+
+            indexThreads = cfg.threadCount;
+            if (indexThreads == 0) {
+                unsigned int hc = std::thread::hardware_concurrency();
+                indexThreads = (hc == 0) ? 4u : static_cast<std::size_t>(hc);
+            }
+            if (indexThreads == 0) indexThreads = 1;
+
             std::cout << "Indexing directory: " << baseDir.generic_string() << "\n";
-            bool ok = indexManager.indexDirectory(baseDir, true);
+            IndexManager::IndexMetrics m;
+            if (cfg.clearIndexOnStart) {
+                indexManager.clearAll();
+            }
+            bool ok = indexManager.indexDirectoryIncremental(baseDir, m, cfg.removeMissing, indexThreads);
             if (!ok) {
                 std::cerr << "WARNING: index directory not found: "
                           << baseDir.generic_string() << "\n";
             } else {
-                std::cout << "Index built.\n";
+                std::cout << "Index built. "
+                          << "scanned=" << m.scanned
+                          << " added=" << m.added
+                          << " reindexed=" << m.reindexed
+                          << " skipped=" << m.skipped
+                          << " removed=" << m.removed
+                          << " failed=" << m.failed
+                          << " timeMs=" << m.timeMs
+                          << "\n";
             }
         }
 
-        std::cout << "Server listening on " << ip << ":" << port << "\n";
+        if (cfg.enableScheduler && cfg.schedulerInterval.count() > 0) {
+            indexScheduler.start(
+                [this, removeMissing = cfg.removeMissing]() {
+                    IndexManager::IndexMetrics m;
+                    bool ok = indexManager.indexDirectoryIncremental(baseDir, m, removeMissing);
+                    if (ok) {
+                        std::ostringstream oss;
+                        oss << "Scheduler index: scanned=" << m.scanned
+                            << " added=" << m.added
+                            << " reindexed=" << m.reindexed
+                            << " skipped=" << m.skipped
+                            << " removed=" << m.removed
+                            << " failed=" << m.failed
+                            << " timeMs=" << m.timeMs;
+                        logger.info(oss.str());
+                    } else {
+                        logger.warn("Scheduler index: directory not found / not a directory");
+                    }
+                },
+                cfg.schedulerInterval,
+                &logger,
+                "index-scheduler"
+            );
+        }
+
+        std::cout << "Server listening on " << cfg.ip << ":" << cfg.port << "\n";
 
         if (!threadPoolStarted) {
-            unsigned int hc = std::thread::hardware_concurrency();
-            if (hc == 0) {
-                hc = 4;
+            std::size_t threads = cfg.threadCount;
+            if (threads == 0) {
+                unsigned int hc = std::thread::hardware_concurrency();
+                threads = (hc == 0) ? 4u : static_cast<std::size_t>(hc);
             }
-            threadPool.start(static_cast<std::size_t>(hc));
+            threadPool.start(threads);
             threadPoolStarted = true;
         }
 
@@ -142,13 +276,13 @@ public:
     }
 
     std::filesystem::path resolvePathToBaseDir(const std::string& raw) const {
-    std::filesystem::path p(raw);
+            std::filesystem::path p(raw);
 
-    if (p.is_absolute()) {
-        return p;
-    }
+        if (p.is_absolute()) {
+            return p;
+        }
 
-    return baseDir / p;
+        return baseDir / p;
     }
 
     void acceptLoop() {
@@ -172,12 +306,13 @@ public:
                 if (stopRequested.load()) {
                     break;
                 }
-                std::cerr << "accept() failed\n";
-                break;
+                continue;
             }
 
-            bool queued = threadPool.enqueue([this, clientSocket]() {
-                this->handleClient(clientSocket);
+            std::string remote = addrToString(clientAddr);
+
+            bool queued = threadPool.enqueue([this, clientSocket, remote]() {
+                this->handleClient(clientSocket, remote);
             });
 
             if (!queued) {
@@ -187,7 +322,9 @@ public:
     }
 
     void stop() {
-        stopRequested.store(true);
+        bool already = stopRequested.exchange(true);
+        (void)already;
+        indexScheduler.stop();
 
         if (listenSocket != INVALID_SOCKET) {
             closeSocket(listenSocket);
@@ -205,6 +342,39 @@ public:
     }
 
 private:
+    static std::string addrToString(const sockaddr_in& addr) {
+        char ipBuf[64] = {0};
+        const char* ip = nullptr;
+#ifdef _WIN32
+        ip = inet_ntop(AF_INET, (void*)&addr.sin_addr, ipBuf, sizeof(ipBuf));
+#else
+        ip = inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
+#endif
+        std::ostringstream oss;
+        oss << (ip ? ip : "unknown") << ":" << ntohs(addr.sin_port);
+        return oss.str();
+    }
+
+#ifndef _WIN32
+    static void posixSignalHandler(int) {
+        if (instanceForSignals) {
+            instanceForSignals->getLogger().warn("Signal received -> stopping server");
+            instanceForSignals->requestStop();
+        }
+    }
+#else
+    static BOOL WINAPI consoleCtrlHandler(DWORD type) {
+        if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT || type == CTRL_BREAK_EVENT) {
+            if (instanceForSignals) {
+                instanceForSignals->getLogger().warn("Console Ctrl event -> stopping server");
+                instanceForSignals->requestStop();
+            }
+            return TRUE;
+        }
+        return FALSE;
+    }
+#endif
+
 
     void handleClient(
     #ifdef _WIN32
@@ -212,6 +382,7 @@ private:
     #else
         int clientSocket
     #endif
+        , const std::string& remote
     ) {
         std::string requestLine;
         bool ok = recvLine(clientSocket, requestLine);
@@ -219,6 +390,8 @@ private:
             closeSocket(clientSocket);
             return;
         }
+
+        logger.info(std::string("Request from ") + remote + ": " + requestLine);
 
         std::string response = processRequest(requestLine);
         if (!response.empty()) {
@@ -238,7 +411,7 @@ private:
     ) {
         outLine.clear();
 
-        const std::size_t MAX_LINE = 16 * 1024; // 16 KB
+        const std::size_t MAX_LINE = 16 * 1024;
 
         char buf[512];
         while (outLine.size() < MAX_LINE) {
@@ -285,7 +458,6 @@ private:
 #ifdef _WIN32
             chunk = ::send(s, ptr, static_cast<int>(left), 0);
 #else
-            // на linux send() приймає size_t, але повертає ssize_t
             chunk = static_cast<int>(::send(s, ptr, left, 0));
 #endif
 
@@ -298,17 +470,18 @@ private:
     }
 
     std::string processRequest(const std::string& request) {
+        Stopwatch totalSw;
         std::istringstream iss(request);
-        std::string command;
-        iss >> command;
+        std::string commandStr;
+        iss >> commandStr;
 
-        if (command == "INDEX_ALL") {
-            bool ok = indexManager.indexDirectory(baseDir, true);
-            if (!ok) {
-                return "ERROR Index directory not found\n";
-            }
-            return "OK 1\nINDEXED\nEND\n";
+        const auto cmdOpt = parseCommand(commandStr);
+        if (!cmdOpt) {
+            return ProtocolResponse::error("Unknown command", totalSw.elapsedMs());
         }
+
+        auto docsTotal = [&]() { return indexManager.documentsCount(); };
+        auto wordsTotal = [&]() { return indexManager.wordsCount(); };
 
         auto readRestAsPath = [&iss]() -> std::string {
             std::string rest;
@@ -325,131 +498,184 @@ private:
             return rest;
         };
 
-        auto okSimple = []() -> std::string {
-            return "OK 1\nEND\n";
-        };
-
-        auto err = [](const std::string& msg) -> std::string {
-            return "ERROR " + msg + "\nEND\n";
-        };
-
-        if (command == "ADD_FILE") {
-            std::string raw = readRestAsPath();
-            std::string path = resolvePathToBaseDir(raw).generic_string();
-            if (path.empty()) return err("Missing path for ADD_FILE");
-
-            unsigned int id = 0;
-            if (indexManager.hasFile(path, id)) {
-                return err("File already indexed");
+               switch (*cmdOpt) {
+            case CommandCode::INDEX_ALL: {
+                IndexManager::IndexMetrics m;
+                Stopwatch sw;
+                bool ok = indexManager.indexDirectoryIncremental(baseDir, m, /*removeMissing*/true, indexThreads);
+                if (!ok) {
+                    return ProtocolResponse::error("Index directory not found", totalSw.elapsedMs());
+                }
+                std::ostringstream body;
+                body << "SCANNED "   << m.scanned   << "\n"
+                     << "ADDED "     << m.added     << "\n"
+                     << "REINDEXED " << m.reindexed << "\n"
+                     << "SKIPPED "   << m.skipped   << "\n"
+                     << "REMOVED "   << m.removed   << "\n"
+                     << "FAILED "    << m.failed    << "\n"
+                     << "INDEX_MS "  << m.timeMs    << "\n";
+                logger.info("INDEX_ALL done in " + std::to_string(sw.elapsedMs()) + "ms");
+                return ProtocolResponse::ok(m.added + m.reindexed,
+                                            totalSw.elapsedMs(),
+                                            docsTotal(),
+                                            wordsTotal(),
+                                            body.str());
             }
 
-            bool ok = indexManager.addFile(path);
-            return ok ? okSimple() : err("Could not read file (not found / no access)");
-        }
+            case CommandCode::ADD_FILE: {
+                std::string raw = readRestAsPath();
+                std::string path = resolvePathToBaseDir(raw).generic_string();
+                if (path.empty()) return ProtocolResponse::error("Missing path for ADD_FILE", totalSw.elapsedMs());
 
-        if (command == "REINDEX_FILE") {
-            std::string raw = readRestAsPath();
-            std::string path = resolvePathToBaseDir(raw).generic_string();
+                unsigned int id = 0;
+                if (indexManager.hasFile(path, id)) {
+                    return ProtocolResponse::error("File already indexed", totalSw.elapsedMs());
+                }
 
-            if (path.empty()) return err("Missing path for REINDEX_FILE");
-
-            bool ok = indexManager.reindexFile(path);
-            return ok ? okSimple() : err("Could not read file (not found / no access)");
-        }
-
-        if (command == "HAS_FILE") {
-            std::string raw = readRestAsPath();
-            std::string path = resolvePathToBaseDir(raw).generic_string();
-            if (path.empty()) return err("Missing path for HAS_FILE");
-
-            unsigned int id = 0;
-            bool found = indexManager.hasFile(path, id);
-            if (!found) {
-                return "OK 0\nEND\n";
-            }
-            return "OK 1\nYES\nEND\n";
-        }
-
-        if (command == "REMOVE_FILE") {
-            std::string raw = readRestAsPath();
-            std::string path = resolvePathToBaseDir(raw).generic_string();
-
-            if (path.empty()) return err("Missing path for REMOVE_FILE");
-
-            bool ok = indexManager.removeFile(path);
-            return ok ? okSimple() : err("File not in index");
-        }
-
-        if (command == "INDEX_DIR" || command == "REINDEX_DIR" || command == "REBUILD_INDEX") {
-            std::string dir = readRestAsPath();
-            if (dir.empty()) return err("Missing dir path");
-
-            if (command == "REBUILD_INDEX") {
-                indexManager.clearAll();
+                Stopwatch sw;
+                bool ok = indexManager.addFile(path);
+                if (!ok) return ProtocolResponse::error("Could not read file (not found / no access)", totalSw.elapsedMs());
+                std::ostringstream body;
+                body << "OP ADD_FILE\n"
+                     << "OP_MS " << sw.elapsedMs() << "\n";
+                return ProtocolResponse::ok(1, totalSw.elapsedMs(), docsTotal(), wordsTotal(), body.str());
             }
 
-            std::size_t indexed = 0;
-            std::size_t failed  = 0;
-            bool reindexExisting = (command == "REINDEX_DIR");
+            case CommandCode::REINDEX_FILE: {
+                std::string raw = readRestAsPath();
+                std::string path = resolvePathToBaseDir(raw).generic_string();
 
-            bool ok = indexManager.indexDirectory(dir, indexed, failed, reindexExisting);
-            if (!ok) return err("Directory not found / not a directory");
+                if (path.empty()) return ProtocolResponse::error("Missing path for REINDEX_FILE", totalSw.elapsedMs());
 
-            std::ostringstream oss;
-            oss << "OK " << indexed << "\n";
-            oss << "FAILED " << failed << "\n";
-            oss << "END\n";
-            return oss.str();
-        }
-
-        if (command == "SEARCH_ONE") {
-            std::string word;
-            iss >> word;
-            if (word.empty()) {
-                return "ERROR Missing word for SEARCH_ONE\n";
+                Stopwatch sw;
+                bool ok = indexManager.reindexFile(path);
+                if (!ok) return ProtocolResponse::error("Could not read file (not found / no access)", totalSw.elapsedMs());
+                std::ostringstream body;
+                body << "OP REINDEX_FILE\n"
+                     << "OP_MS " << sw.elapsedMs() << "\n";
+                return ProtocolResponse::ok(1, totalSw.elapsedMs(), docsTotal(), wordsTotal(), body.str());
             }
 
-            std::vector<std::string> results;
-            bool found = indexManager.searchSingleWord(word, results);
-            return formatSearchResponse(found, results);
-        }
+              case CommandCode::HAS_FILE: {
+                std::string raw = readRestAsPath();
+                std::string path = resolvePathToBaseDir(raw).generic_string();
+                if (path.empty()) return ProtocolResponse::error("Missing path for HAS_FILE", totalSw.elapsedMs());
 
-        if (command == "SEARCH_ALL" || command == "SEARCH_ANY") {
-            std::vector<std::string> words;
-            std::string w;
-            while (iss >> w) {
-                words.push_back(w);
-            }
-            if (words.empty()) {
-                return "ERROR No words provided\n";
+                 unsigned int id = 0;
+                bool found = indexManager.hasFile(path, id);
+                if (!found) {
+                    return ProtocolResponse::ok(0, totalSw.elapsedMs(), docsTotal(), wordsTotal(), "");
+                }
+                return ProtocolResponse::ok(1, totalSw.elapsedMs(), docsTotal(), wordsTotal(), "YES\n");
             }
 
-            std::vector<std::string> results;
-            bool found = false;
-            if (command == "SEARCH_ALL") {
-                found = indexManager.searchAllWords(words, results);
-            } else {
-                found = indexManager.searchAnyWord(words, results);
+            case CommandCode::REMOVE_FILE: {
+                std::string raw = readRestAsPath();
+                std::string path = resolvePathToBaseDir(raw).generic_string();
+
+                if (path.empty()) return ProtocolResponse::error("Missing path for REMOVE_FILE", totalSw.elapsedMs());
+
+                Stopwatch sw;
+                bool ok = indexManager.removeFile(path);
+                if (!ok) return ProtocolResponse::error("File not in index", totalSw.elapsedMs());
+                std::ostringstream body;
+                body << "OP REMOVE_FILE\n"
+                     << "OP_MS " << sw.elapsedMs() << "\n";
+                return ProtocolResponse::ok(1, totalSw.elapsedMs(), docsTotal(), wordsTotal(), body.str());
             }
-            return formatSearchResponse(found, results);
+
+            case CommandCode::INDEX_DIR:
+            case CommandCode::REINDEX_DIR:
+            case CommandCode::REBUILD_INDEX: {
+                std::string dir = readRestAsPath();
+                if (dir.empty()) return ProtocolResponse::error("Missing dir path", totalSw.elapsedMs());
+
+                if (*cmdOpt == CommandCode::REBUILD_INDEX) {
+                    indexManager.clearAll();
+                }
+
+                Stopwatch sw;
+                if (*cmdOpt == CommandCode::INDEX_DIR) {
+                    std::size_t indexed = 0;
+                    std::size_t failed  = 0;
+                    bool ok = indexManager.indexDirectory(dir, indexed, failed, /*reindexExisting*/false);
+                    if (!ok) return ProtocolResponse::error("Directory not found / not a directory", totalSw.elapsedMs());
+                    std::ostringstream body;
+                    body << "OP INDEX_DIR\n"
+                         << "INDEXED " << indexed << "\n"
+                         << "FAILED "  << failed  << "\n"
+                         << "OP_MS "   << sw.elapsedMs() << "\n";
+                    return ProtocolResponse::ok(indexed, totalSw.elapsedMs(), docsTotal(), wordsTotal(), body.str());
+                }
+
+                if (*cmdOpt == CommandCode::REINDEX_DIR) {
+                    std::size_t indexed = 0;
+                    std::size_t failed  = 0;
+                    bool ok = indexManager.indexDirectory(dir, indexed, failed, /*reindexExisting*/true);
+                    if (!ok) return ProtocolResponse::error("Directory not found / not a directory", totalSw.elapsedMs());
+                    std::ostringstream body;
+                    body << "OP REINDEX_DIR\n"
+                         << "INDEXED " << indexed << "\n"
+                         << "FAILED "  << failed  << "\n"
+                         << "OP_MS "   << sw.elapsedMs() << "\n";
+                    return ProtocolResponse::ok(indexed, totalSw.elapsedMs(), docsTotal(), wordsTotal(), body.str());
+                }
+
+                IndexManager::IndexMetrics m;
+                bool ok = indexManager.indexDirectoryIncremental(dir, m, /*removeMissing*/true, indexThreads);
+                if (!ok) return ProtocolResponse::error("Directory not found / not a directory", totalSw.elapsedMs());
+ 
+
+                std::ostringstream body;
+                body << "OP REBUILD_INDEX\n"
+                     << "SCANNED "   << m.scanned   << "\n"
+                     << "ADDED "     << m.added     << "\n"
+                     << "REINDEXED " << m.reindexed << "\n"
+                     << "SKIPPED "   << m.skipped   << "\n"
+                     << "REMOVED "   << m.removed   << "\n"
+                     << "FAILED "    << m.failed    << "\n"
+                     << "INDEX_MS "  << m.timeMs    << "\n"
+                     << "OP_MS "     << sw.elapsedMs() << "\n";
+                return ProtocolResponse::ok(m.added + m.reindexed, totalSw.elapsedMs(), docsTotal(), wordsTotal(), body.str());
+            }
+
+            case CommandCode::SEARCH_ONE: {
+                std::string word;
+                iss >> word;
+                if (word.empty()) {
+                    return ProtocolResponse::error("Missing word for SEARCH_ONE", totalSw.elapsedMs());
+                }
+
+                std::vector<std::string> results;
+                Stopwatch sw;
+                bool found = indexManager.searchSingleWord(word, results);
+                return ProtocolResponse::search(found, results, sw.elapsedMs(), totalSw.elapsedMs(), docsTotal(), wordsTotal());
+            }
+
+            case CommandCode::SEARCH_ALL:
+            case CommandCode::SEARCH_ANY: {
+                std::vector<std::string> words;
+                std::string w;
+                while (iss >> w) {
+                    words.push_back(w);
+                }
+                if (words.empty()) {
+                    return ProtocolResponse::error("No words provided", totalSw.elapsedMs());
+                }
+
+                std::vector<std::string> results;
+                bool found = false;
+                Stopwatch sw;
+                if (*cmdOpt == CommandCode::SEARCH_ALL) {
+                    found = indexManager.searchAllWords(words, results);
+                } else {
+                    found = indexManager.searchAnyWord(words, results);
+                }
+                return ProtocolResponse::search(found, results, sw.elapsedMs(), totalSw.elapsedMs(), docsTotal(), wordsTotal());
+            }
         }
 
-        return "ERROR Unknown command\n";
-    }
-
-    std::string formatSearchResponse(bool found,
-                                     const std::vector<std::string>& results) {
-        if (!found || results.empty()) {
-            return "OK 0\nEND\n";
-        }
-
-        std::ostringstream oss;
-        oss << "OK " << results.size() << "\n";
-        for (const std::string& path : results) {
-            oss << path << "\n";
-        }
-        oss << "END\n";
-        return oss.str();
+        return ProtocolResponse::error("Unknown command", totalSw.elapsedMs());
     }
 
     void closeSocket(
@@ -479,6 +705,12 @@ private:
 
     IndexManager indexManager;
     std::filesystem::path baseDir = std::filesystem::path("text_files") / "aclImdb";
+    Logger logger;
+
+    RepeatingTask indexScheduler;
+    std::size_t indexThreads = 1;
+
+    static inline Server* instanceForSignals = nullptr;
 };
 
 #endif
